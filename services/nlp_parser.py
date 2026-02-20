@@ -1,4 +1,3 @@
-# services/nlp_parser.py
 from __future__ import annotations
 
 import re
@@ -25,19 +24,15 @@ RU_MONTHS = {
 
 DATE_DOT_RE = re.compile(r"\b(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?\b")
 DATE_RU_RE = re.compile(r"\b(\d{1,2})\s+([а-яё]+)\b", re.IGNORECASE)
-TIME_RE = re.compile(r"\b([01]?\d|2[0-3])[:\.]([0-5]\d)\b")
-
+TIME_HHMM_RE = re.compile(r"\b([01]?\d|2[0-3])\s*[:\.]\s*([0-5]\d)\b")
+TIME_HH_ONLY_RE = re.compile(r"(?i)\bв\s*([01]?\d|2[0-3])\b")
+TIME_SPACE_RE = re.compile(r"\b([01]?\d|2[0-3])\s+([0-5]\d)\b")
 
 @dataclass
 class ParsedCreateTask:
     title: str
     due_at_utc: datetime  # ✅ UTC aware
     kind: str  # "deadline" | "task"
-
-
-def _normalize_spaces(s: str) -> str:
-    return " ".join(s.strip().split())
-
 
 def _pick_year(month: int, day: int, now_local: datetime) -> int:
     """Если дата уже прошла в этом году (по локальному времени) — берем следующий год."""
@@ -49,11 +44,22 @@ def _pick_year(month: int, day: int, now_local: datetime) -> int:
 
 
 def _extract_time(text: str) -> time | None:
-    m = TIME_RE.search(text)
-    if not m:
-        return None
-    return time(int(m.group(1)), int(m.group(2)))
+    # HH:MM или HH.MM (19:40 / 19.40)
+    m = re.search(r"\b([01]?\d|2[0-3])\s*[:\.]\s*([0-5]\d)\b", text)
+    if m:
+        return time(int(m.group(1)), int(m.group(2)))
 
+    # "19 40"
+    m = re.search(r"\b([01]?\d|2[0-3])\s+([0-5]\d)\b", text)
+    if m:
+        return time(int(m.group(1)), int(m.group(2)))
+
+    # "в 19"
+    m = re.search(r"(?i)\bв\s*([01]?\d|2[0-3])\b", text)
+    if m:
+        return time(int(m.group(1)), 0)
+
+    return None
 
 def _extract_date(text: str, now_local: datetime) -> date | None:
     m = DATE_DOT_RE.search(text)
@@ -85,58 +91,50 @@ def _extract_date(text: str, now_local: datetime) -> date | None:
         except ValueError:
             return None
 
-    low = text.lower()
-    if "послезавтра" in low:
+    low = text.lower().replace("ё", "е")
+
+    def has_word(w: str) -> bool:
+        # границы "слова" считаем по буквам/цифрам/подчёркиванию (надежнее, чем \b для Unicode)
+        return re.search(rf"(?<![a-zа-я0-9_]){w}(?![a-zа-я0-9_])", low) is not None
+
+    if has_word("послезавтра"):
         return date.fromordinal(now_local.date().toordinal() + 2)
-    if "завтра" in low:
+
+    if has_word("завтра"):
         return date.fromordinal(now_local.date().toordinal() + 1)
-    if "сегодня" in low:
+
+    if has_word("сегодня"):
         return now_local.date()
 
     return None
 
+def _norm(s: str) -> str:
+    return " ".join(s.strip().split())
 
 def try_parse_create_task(text: str) -> ParsedCreateTask | None:
-    """
-    Парсим фразы типа:
-    - "добавь дедлайн 08 марта по сдаче СРС по ЦОС"
-    - "создай задачу завтра в 18:30 сделать лабораторную"
-    """
     now_local = datetime.now(LOCAL_TZ)
-
-    t = _normalize_spaces(text)
+    t = _norm(text)
     low = t.lower()
 
-    has_create_verb = any(k in low for k in ("добавь", "добавить", "создай", "создать", "запланируй", "запланировать"))
-    has_task_words = any(k in low for k in ("дедлайн", "задача", "напомни", "напоминание", "сдать", "сдача"))
-
-    if not (has_create_verb or has_task_words):
-        return None
-
-    is_deadline = "дедлайн" in low or "сдать" in low or "сдача" in low
-
+    # ✅ 1) Сначала пытаемся найти дату
     d = _extract_date(t, now_local)
     if not d:
         return None
 
-    tm = _extract_time(t)
-    if tm is None:
-        tm = time(23, 59) if is_deadline else time(9, 0)
+    # ✅ 2) Если дата есть — считаем это задачей, если есть хоть один "триггер"
+    triggers = ("добав", "созд", "задач", "дедлайн", "напомн", "сдать", "сдач", "календар")
+    if not any(trg in low for trg in triggers):
+        return None
 
-    # ✅ Локальное время Якутска → UTC
+    is_deadline = any(w in low for w in ("дедлайн", "сдать", "сдача"))
+    tm = _extract_time(t) or (time(23, 59) if is_deadline else time(9, 0))
+
     due_local = datetime(d.year, d.month, d.day, tm.hour, tm.minute, tzinfo=LOCAL_TZ)
     due_utc = due_local.astimezone(timezone.utc)
 
     title = re.sub(r"(?i)\b(добавь|добавить|создай|создать|запланируй|запланировать)\b", "", t)
     title = re.sub(r"(?i)\b(в календарь|календарь)\b", "", title)
     title = re.sub(r"(?i)\bдедлайн\b", "", title)
-    title = _normalize_spaces(title)
+    title = _norm(title) or "Задача"
 
-    if not title:
-        title = "Задача"
-
-    return ParsedCreateTask(
-        title=title,
-        due_at_utc=due_utc,
-        kind=("deadline" if is_deadline else "task"),
-    )
+    return ParsedCreateTask(title=title, due_at_utc=due_utc, kind=("deadline" if is_deadline else "task"))
