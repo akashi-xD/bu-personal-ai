@@ -10,5 +10,5 @@ async def start_handler(message: types.Message):
 
 @router.message()
 async def chat_handler(message: types.Message):
-    reply = await ask_gpt(message.text)
+    reply = await ask_gpt([{"role": "user", "content": message.text}])
     await message.answer(reply)
