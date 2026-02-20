@@ -1,38 +1,41 @@
 import os
-from typing import Dict, List, Optional
+from openai import AsyncOpenAI
+
+YANDEX_API_KEY = os.getenv("YANDEX_API_KEY", "").strip()
+YANDEX_FOLDER_ID = os.getenv("YANDEX_FOLDER_ID", "").strip()
+YANDEX_MODEL = os.getenv("YANDEX_MODEL", "yandexgpt-lite").strip()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-YANDEX_API_KEY = os.getenv("YANDEX_API_KEY", "").strip()
 
-PROVIDER: str
-if YANDEX_API_KEY and YANDEX_API_KEY != "placeholder":
-    PROVIDER = "yandex"
-elif OPENAI_API_KEY and not OPENAI_API_KEY.startswith("sk-placeholder"):
-    PROVIDER = "openai"
-else:
-    PROVIDER = "none"
-
-openai_client: Optional[object] = None
-if PROVIDER == "openai":
-    from openai import AsyncOpenAI
-    openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
-
-
-async def ask_gpt(messages: List[Dict]) -> str:
-    """Универсальная функция для запросов к AI."""
-    if PROVIDER == "yandex":
-        from services.yandex_service import ask_yandexgpt
-        return await ask_yandexgpt(messages)
-
-    if PROVIDER == "openai":
-        assert openai_client is not None
-        resp = await openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=messages,
+def _make_client() -> AsyncOpenAI:
+    # Если есть Yandex — используем его (приоритет)
+    if YANDEX_API_KEY and YANDEX_FOLDER_ID:
+        return AsyncOpenAI(
+            api_key=YANDEX_API_KEY,
+            base_url="https://ai.api.cloud.yandex.net/v1",
+            project=YANDEX_FOLDER_ID,
+            # можно отключить логирование данных (опционально)
+            default_headers={"x-data-logging-enabled": "false"},
         )
-        return resp.choices[0].message.content or ""
+    # Иначе (на будущее) — обычный OpenAI
+    if OPENAI_API_KEY:
+        return AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-    return (
-        "[TEST MODE] AI not configured.\n"
-        "Add YANDEX_API_KEY or OPENAI_API_KEY to .env"
+    # Иначе тестовый режим
+    return None  # type: ignore
+
+client = _make_client()
+
+async def ask_gpt(prompt: str) -> str:
+    if client is None:
+        return "[TEST MODE] Укажи YANDEX_API_KEY и YANDEX_FOLDER_ID в .env"
+
+    resp = await client.chat.completions.create(
+        model=YANDEX_MODEL,
+        messages=[
+            {"role": "system", "content": "Ты поддерживающий AI ассистент по имени БУ!"},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.4,
     )
+    return resp.choices[0].message.content or ""
